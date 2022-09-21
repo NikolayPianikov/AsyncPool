@@ -2,9 +2,9 @@
 
 public class Rent<T>: IRent<T>
 {
-    private readonly Action _releaseAction;
+    private readonly Action<T> _releaseAction;
 
-    public Rent(T value, Action releaseAction)
+    public Rent(T value, Action<T> releaseAction)
     {
         _releaseAction = releaseAction;
         Value = value;
@@ -12,5 +12,5 @@ public class Rent<T>: IRent<T>
     
     public T Value { get; }
 
-    public void Dispose() => _releaseAction();
+    public void Dispose() => _releaseAction(Value);
 }

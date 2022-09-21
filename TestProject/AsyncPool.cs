@@ -1,19 +1,22 @@
 ﻿namespace TestProject;
 
-class AsyncPool<T, TState> : IAsyncPool<T, TState>
+public class AsyncPool<T, TState> : IAsyncPool<T, TState>, IPoolManager
 {
     private readonly object _lockObject = new();
     private readonly IAsyncFactory<T, TState> _factory;
-    private readonly Queue<TaskCompletionSource<T>> _queue = new();
+    private readonly LinkedList<Source> _queue = new();
     private readonly LinkedList<T> _pool = new();
-    private int _count;
+    private readonly int _size;
+    private int _currentSize;
 
-    public AsyncPool(int count, IAsyncFactory<T, TState> factory)
+    public AsyncPool(int size, IAsyncFactory<T, TState> factory)
     {
-        _count = count;
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size));
+        _size = size;
+        _currentSize = size;
         _factory = factory;
     }
-
+    
     internal int QueueSize
     {
         get
@@ -36,7 +39,7 @@ class AsyncPool<T, TState> : IAsyncPool<T, TState>
         }
     }
 
-    public async Task<IRent<T>> Rent(TState state, CancellationToken cancellationToken)
+    public async Task<IRent<T>> RentAsync(TState state, CancellationToken cancellationToken)
     {
         Task<T> valueTask;
         lock (_lockObject)
@@ -48,37 +51,73 @@ class AsyncPool<T, TState> : IAsyncPool<T, TState>
             }
             else
             {
-                if (_count > 0)
+                if (_currentSize > 0)
                 {
-                    valueTask = _factory.Create(state, cancellationToken);
-                    _count--;
+                    valueTask = _factory.CreateAsync(state, cancellationToken);
+                    _currentSize--;
                 }
                 else
                 {
-                    var taskCompletionSource = new TaskCompletionSource<T>(cancellationToken);
-                    valueTask = taskCompletionSource.Task;
-                    _queue.Enqueue(taskCompletionSource);
+                    var taskSource = new TaskCompletionSource<T>(cancellationToken);
+                    valueTask = taskSource.Task;
+                    var sources = new Source?[1];
+                    var registration = cancellationToken.Register(() =>
+                    {
+                        lock (_lockObject)
+                        {
+                            taskSource.TrySetCanceled();
+                            var source = sources[0];
+                            if (source.HasValue)
+                            {
+                                _queue.Remove(source.Value);
+                            }
+                        }
+                    });
+
+                    var source = new Source(taskSource, registration);
+                    sources[0] = source;
+                    _queue.AddLast(source);
                 }
             }
         }
 
-        var value = await valueTask;
-        return new Rent<T>(value, () => { Release(value); });
+        return new Rent<T>(await valueTask, Release);
     }
-    
+
+    public void Clear()
+    {
+        lock (_lockObject)
+        {
+            _pool.Clear();
+            foreach (var source in _queue)
+            {
+                source.TaskSource.TrySetCanceled();
+                source.CancellationRegistration.Dispose();
+            }
+
+            _queue.Clear();
+            _currentSize = _size;
+        }
+    }
+
     private void Release(T value)
     {
         lock (_lockObject)
         {
-            if (_queue.Count > 0)
+            while(_queue.Count > 0)
             {
-                var task = _queue.Dequeue();
-                task.SetResult(value);       
+                var source = _queue.First!.Value;
+                _queue.RemoveFirst();
+                source.CancellationRegistration.Dispose();
+                if (source.TaskSource.TrySetResult(value))
+                {
+                    return;
+                }
             }
-            else
-            {
-                _pool.AddLast(value);
-            }
+            
+            _pool.AddLast(value);
         }
     }
+
+    private readonly record struct Source(TaskCompletionSource<T> TaskSource, IDisposable CancellationRegistration);
 }
