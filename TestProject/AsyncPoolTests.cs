@@ -1,5 +1,6 @@
 using Moq;
 using Shouldly;
+using Range = Moq.Range;
 
 namespace TestProject;
 
@@ -72,15 +73,12 @@ public class AsyncPoolTests: IDisposable
         
         // When
         var rentTask = pool.RentAsync(99, _cancellationToken);
-        pool.QueueSize.ShouldBe(1);
         pool.PoolSize.ShouldBe(0);
-        rent.Dispose();
-        pool.QueueSize.ShouldBe(0);
         rent.Dispose();
 
         // Then
         rentTask.Result.Value.ShouldBe(2);
-        pool.PoolSize.ShouldBe(1);
+        pool.PoolSize.ShouldBe(0);
         _factory.Verify(i => i.CreateAsync(1, _cancellationToken), Times.Once);
     }
     
@@ -94,86 +92,47 @@ public class AsyncPoolTests: IDisposable
         
         // When
         var rentTask = pool.RentAsync(99, cancellationTokenSource.Token);
+        new SpinWait().SpinOnce();
         cancellationTokenSource.Cancel();
-        rentTask.Status.ShouldBe(TaskStatus.Canceled);
 
         // Then
-        rentTask.Status.ShouldBe(TaskStatus.Canceled);
-    }
-    
-    [Fact]
-    public async Task ShouldClearQueueWhenTaskIsCanceled()
-    {
-        // Given
-        var pool = CreateInstance(1);
-        await pool.RentAsync(1, _cancellationToken);
-        var cancellationTokenSource = new CancellationTokenSource();
-        
-        // When
-        var rentTask = pool.RentAsync(99, cancellationTokenSource.Token);
-        cancellationTokenSource.Cancel();
-        rentTask.Status.ShouldBe(TaskStatus.Canceled);
-
-        // Then
-        pool.QueueSize.ShouldBe(0);
-    }
-    
-    [Fact]
-    public async Task ShouldClearAndCancelTasks()
-    {
-        // Given
-        var pool = CreateInstance(2);
-        await pool.RentAsync(1, _cancellationToken);
-        await pool.RentAsync(99, _cancellationToken);
-        var rentTask1 = pool.RentAsync(99, _cancellationToken);
-        var rentTask2 = pool.RentAsync(99, _cancellationToken);
-        pool.QueueSize.ShouldBe(2);
-        pool.PoolSize.ShouldBe(0);
-        
-        // When
-        pool.Clear();
-
-        // Then
-        pool.PoolSize.ShouldBe(0);
-        pool.QueueSize.ShouldBe(0);
-        rentTask1.Status.ShouldBe(TaskStatus.Canceled);
-        rentTask2.Status.ShouldBe(TaskStatus.Canceled);
-    }
-    
-    [Fact]
-    public async Task ShouldRentAfterClear()
-    {
-        // Given
-        var pool = CreateInstance(2);
-        await pool.RentAsync(1, _cancellationToken);
-        await pool.RentAsync(99, _cancellationToken);
-#pragma warning disable CS4014
-        pool.RentAsync(99, _cancellationToken);
-        pool.RentAsync(99, _cancellationToken);
-#pragma warning restore CS4014
-        pool.Clear();
-        
-        // When
-        var rent = await pool.RentAsync(33, _cancellationToken);
-
-        // Then
-        rent.Value.ShouldBe(34);
+        rentTask.Status.ShouldNotBe(TaskStatus.Canceled);
     }
     
     [Theory]
-    [InlineData(-1)]
-    [InlineData(0)]
-    public void ShouldThrowArgumentOutOfRangeExceptionWhenSizeIsEqOrLessZero(int size)
+    [InlineData(1)]
+    [InlineData(10)]
+    [InlineData(20)]
+    public void ShouldNotExceedSize(int size)
     {
         // Given
-
+        var pool = CreateInstance(size);
+        var tasks = new List<Task>();
+        var spinWait = new SpinWait();
+        
         // When
+        for (var i = 0; i < size * 10; i++)
+        {
+            var task = pool
+                .RentAsync(1, _cancellationToken)
+                .ContinueWith(task =>
+                    {
+                        spinWait.SpinOnce();
+                        task.Result.Dispose();
+                    },
+                    _cancellationToken);
+                
+            tasks.Add(task);    
+        }
+
+        Task.WaitAll(tasks.ToArray());
         
         // Then
-        Should.Throw<ArgumentOutOfRangeException>(() => CreateInstance(size));
+        pool.PoolSize.ShouldBeLessThanOrEqualTo(size);
+        _factory.Verify(i => i.CreateAsync(1, _cancellationToken), Times.Between(1, size, Range.Inclusive));
     }
-    
-    private AsyncPool<int, int> CreateInstance(int size) => new(size, _factory.Object);
+
+    private AsyncPool<int, int> CreateInstance(int size) => new(new SemaphoreSlim(size), _factory.Object);
 
     void IDisposable.Dispose() => _cancellationTokenSource.Dispose();
 }
